@@ -1,6 +1,7 @@
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+#include "cublas_v2.h"
 
 #include <stdio.h>
 #include <iostream>
@@ -8,12 +9,34 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include <cstdio>
+#include <cstdlib>
+
+
+
+#if __DEVICE_EMULATION__
+#define DEBUG_SYNC __syncthreads();
+#else
+#define DEBUG_SYNC
+#endif
+
+#if (__CUDA_ARCH__ < 200)
+#define int_mult(x,y)	__mul24(x,y)	
+#else
+#define int_mult(x,y)	x*y
+#endif
 
 /*********************************************************************************************************************
 									DECLARATION OF MACROS AND GLOBAL VARIABLES
 *********************************************************************************************************************/
-#define N 51200000
-#define ITERATION 100
+#define N 5120000
+#define ITERATION 10
+
+const int blockSize1 = 4096 / 2;
+
+const int threads = 64;
+
+#define inf ULLONG_MAX 
 
 double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
 int	   DECIMALPLACE = 1;
@@ -27,37 +50,180 @@ __device__ double pow(int DECIMALPLACE) {
 	return temp;
 }
 
-__device__ __forceinline__ float atomicMinFloat(float *addr, float value) {
-	float old;
-	old = (value >= 0) ? __int_as_float(atomicMin((int *)addr, __float_as_int(value))) :
-		__uint_as_float(atomicMax((unsigned int *)addr, __float_as_uint(value)));
 
-	return old;
+__device__ void warp_reduce_max(volatile double smem[64])
+{
+
+	smem[threadIdx.x] = smem[threadIdx.x + 32] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 32] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 16] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 16] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 8] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 8] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 4] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 4] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 2] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 2] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 1] > smem[threadIdx.x] ?
+		smem[threadIdx.x + 1] : smem[threadIdx.x];
+
 }
 
-__device__ __forceinline__ float atomicMaxFloat(float * addr, float value) {
-	float old;
-	old = (value >= 0) ? __int_as_float(atomicMax((int *)addr, __float_as_int(value))) :
-		__uint_as_float(atomicMin((unsigned int *)addr, __float_as_uint(value)));
+__device__ void warp_reduce_min(volatile double smem[64])
+{
 
-	return old;
+	smem[threadIdx.x] = smem[threadIdx.x + 32] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 32] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 16] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 16] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 8] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 8] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 4] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 4] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 2] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 2] : smem[threadIdx.x];
+
+	smem[threadIdx.x] = smem[threadIdx.x + 1] < smem[threadIdx.x] ?
+		smem[threadIdx.x + 1] : smem[threadIdx.x];
+
 }
 
-__global__ void findMaxKernel(float *g_inData, float *d_max) {
-	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
+template<int els_per_block, int threads>
+__global__ void find_min_max(double* in, double* out)
+{
+	__shared__ double smem_min[64];
+	__shared__ double smem_max[64];
 
-	atomicMaxFloat(&d_max[blockIdx.x], g_inData[globalID]);
+	int tid = threadIdx.x + blockIdx.x*els_per_block;
+
+	double max = -inf;
+	double min = inf;
+	double val;
+
+	const int iters = els_per_block / threads;
+
+#pragma unroll  
+	for (int i = 0; i < iters; i++)
+	{
+
+		val = in[tid + i * threads];
+
+		min = val < min ? val : min;
+		max = val > max ? val : max;
+
+	}
+
+
+	if (threads == 32)
+	{
+		smem_min[threadIdx.x + 32] = 0.0f;
+		smem_max[threadIdx.x + 32] = 0.0f;
+
+	}
+
+	smem_min[threadIdx.x] = min;
+	smem_max[threadIdx.x] = max;
+
+
 	__syncthreads();
 
+	if (threadIdx.x < 32)
+	{
+		warp_reduce_min(smem_min);
+		warp_reduce_max(smem_max);
+	}
+	if (threadIdx.x == 0)
+	{
+		out[blockIdx.x] = smem_min[threadIdx.x]; // out[0] == ans
+		out[blockIdx.x + gridDim.x] = smem_max[threadIdx.x];
+	}
+
 }
 
-__global__ void findMinKernel(float *g_inData, float *d_min) {
-	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
+template<int threads>
+__global__ void find_min_max_dynamic(double* in, double* out, int n, int start_adr, int num_blocks)
+{
 
-	atomicMinFloat(&d_min[blockIdx.x], g_inData[globalID]);
+	__shared__ double smem_min[64];
+	__shared__ double smem_max[64];
+
+	int tid = threadIdx.x + start_adr;
+
+	double max = -inf;
+	double min = inf;
+	double val;
+
+
+	// tail part
+	int mult = 0;
+	for (int i = 1; mult + tid < n; i++)
+	{
+		val = in[tid + mult];
+
+		min = val < min ? val : min;
+		max = val > max ? val : max;
+
+		mult = int_mult(i, threads);
+	}
+
+	// previously reduced MIN part
+	mult = 0;
+	int i;
+	for (i = 1; mult + threadIdx.x < num_blocks; i++)
+	{
+		val = out[threadIdx.x + mult];
+
+		min = val < min ? val : min;
+
+		mult = int_mult(i, threads);
+	}
+
+	// MAX part
+	for (; mult + threadIdx.x < num_blocks * 2; i++)
+	{
+		val = out[threadIdx.x + mult];
+
+		max = val > max ? val : max;
+
+		mult = int_mult(i, threads);
+	}
+
+
+	if (threads == 32)
+	{
+		smem_min[threadIdx.x + 32] = 0.0f;
+		smem_max[threadIdx.x + 32] = 0.0f;
+
+	}
+
+	smem_min[threadIdx.x] = min;
+	smem_max[threadIdx.x] = max;
+
 	__syncthreads();
 
+	if (threadIdx.x < 32)
+	{
+		warp_reduce_min(smem_min);
+		warp_reduce_max(smem_max);
+	}
+	if (threadIdx.x == 0)
+	{
+		out[blockIdx.x] = smem_min[threadIdx.x]; // out[0] == ans
+		out[blockIdx.x + gridDim.x] = smem_max[threadIdx.x];
+	}
+
+
 }
+
 
 __global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *g_outData, int DECIMALPLACE) {
 	extern __shared__ double sharedMem[];
@@ -88,7 +254,7 @@ RAND_MAX = 32767
 double GetRand()
 {
 
-	return (double)rand() / (double)RAND_MAX;
+	return (double)rand() / (double)RAND_MAX *1000000;
 }
 
 
@@ -133,80 +299,57 @@ void Statistics(double* h_inData, int n, bool verbosity) {
 	}
 }
 
-//void Statistics(double* h_inData, int n, int gridSize, int blockSize) {
-//	minV = 0, maxV = 0;
-//
-//	(float*)realloc(h_inData, n * sizeof(float));
-//
-//	float *d_inData; cudaMalloc(&d_inData, N * sizeof(float));
-//	cudaMemcpy(d_inData, h_inData, N * sizeof(float), cudaMemcpyHostToDevice);
-//	float *d_min; cudaMalloc(&d_min, gridSize * sizeof(float));
-//	float *d_max; cudaMalloc(&d_max, gridSize * sizeof(float));
-//
-//
-//	findMaxKernel << <gridSize, blockSize >> > (d_inData, d_max);
-//	cudaDeviceSynchronize();
-//
-//	findMinKernel << <gridSize, blockSize >> > (d_inData, d_min);
-//	cudaDeviceSynchronize();
-//
-//	float *h_min = (float*)malloc(gridSize * sizeof(float));
-//	float *h_max = (float*)malloc(gridSize * sizeof(float));
-//
-//	cudaMemcpy(h_min, d_min, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
-//	cudaMemcpy(h_max, d_max, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
-//
-//	cudaFree(d_inData);
-//	cudaFree(d_max);
-//	cudaFree(d_min);
-//
-//	n = gridSize;
-//
-//	while (n > 100000) {
-//		gridSize = (n + blockSize - 1) / blockSize;
-//		float *d_inMin; cudaMalloc(&d_inMin, n * sizeof(float));
-//		float *d_inMax; cudaMalloc(&d_inMax, n * sizeof(float));
-//		cudaMemcpy(d_inMin, h_min, n * sizeof(float), cudaMemcpyHostToDevice);
-//		cudaMemcpy(d_inMax, h_max, n * sizeof(float), cudaMemcpyHostToDevice);
-//
-//		float *d_outMin; cudaMalloc(&d_outMin, gridSize * sizeof(float));
-//		float *d_outMax; cudaMalloc(&d_outMax, gridSize * sizeof(float));
-//
-//		findMaxKernel << <gridSize, blockSize >> > (d_inMin, d_outMin);
-//		cudaDeviceSynchronize();
-//
-//		findMinKernel << <gridSize, blockSize >> > (d_inMax, d_outMax);
-//		cudaDeviceSynchronize();
-//
-//		(float*)realloc(h_min, gridSize * sizeof(float));
-//		(float*)realloc(h_max, gridSize * sizeof(float));
-//
-//		cudaMemcpy(h_min, d_outMin, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
-//		cudaMemcpy(h_max, d_outMax, gridSize * sizeof(float), cudaMemcpyDeviceToHost);
-//
-//		n = gridSize;
-//		cudaFree(d_inMax);
-//		cudaFree(d_inMin);
-//		cudaFree(d_outMax);
-//		cudaFree(d_outMin);
-//	}
-//
-//	minV = h_min[0];
-//	maxV = h_max[0];
-//
-//	for (int i = 0; i < n; i++)
-//	{
-//		maxV = fmax(maxV, h_max[i]);
-//		minV = fmin(minV, h_min[i]);
-//	}
-//
-//	printf("Maximum number is %.25lf\n", maxV);
-//	printf("Minimum number is %.25lf\n", minV);
-//
-//	free(h_min);
-//	free(h_max);
-//
-//}
+void findBlockSize(int* whichSize, int* num_el)
+{
+
+	const float pretty_big_number = 24.0f*1024.0f*1024.0f;
+
+	float ratio = float((*num_el)) / pretty_big_number;
+
+
+	if (ratio > 0.8f)
+		(*whichSize) = 5;
+	else if (ratio > 0.6f)
+		(*whichSize) = 4;
+	else if (ratio > 0.4f)
+		(*whichSize) = 3;
+	else if (ratio > 0.2f)
+		(*whichSize) = 2;
+	else
+		(*whichSize) = 1;
+
+
+}
+
+void compute_reduction(double* d_in, double* d_out, int num_els)
+{
+
+	int whichSize = -1;
+
+	findBlockSize(&whichSize, &num_els);
+
+	//whichSize = 5;
+
+	int block_size = powf(2, whichSize - 1)*blockSize1;
+	int num_blocks = num_els / block_size;
+	int tail = num_els - num_blocks * block_size;
+	int start_adr = num_els - tail;
+
+
+	if (whichSize == 1)
+		find_min_max<blockSize1, threads> << < num_blocks, threads >> > (d_in, d_out);
+	else if (whichSize == 2)
+		find_min_max<blockSize1 * 2, threads> << < num_blocks, threads >> > (d_in, d_out);
+	else if (whichSize == 3)
+		find_min_max<blockSize1 * 4, threads> << < num_blocks, threads >> > (d_in, d_out);
+	else if (whichSize == 4)
+		find_min_max<blockSize1 * 8, threads> << < num_blocks, threads >> > (d_in, d_out);
+	else
+		find_min_max<blockSize1 * 16, threads> << < num_blocks, threads >> > (d_in, d_out);
+
+	find_min_max_dynamic<threads> << < 1, threads >> > (d_in, d_out, num_els, start_adr, num_blocks);
+
+}
 
 
 int FindMaxDecimalPlaces(int blockSize, int gridSize) {
@@ -275,30 +418,48 @@ int main() {
 		testSum = 0;
 		printf("CPU Summation begins...\n");
 		begin = clock();
-		for (int i = 0; i < N; i++)
+		/*for (int i = 0; i < N; i++)
 		{
 			testSum += h_inData[i];
-		}
+		}*/
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("CPU Summation spent %lf seconds.\n", time_spent);
 
-		/*********************************************************************************************************************
-													DATA STATISTICS
-		*********************************************************************************************************************/
-		//std::cout << "Raw data analysis:" << std::endl;
-		printf("Statistics begins...\n");
+		
+		/*******************************************************************************************************
+													FIND MIN AND MAX
+		********************************************************************************************************/
+		
 		begin = clock();
 
-		Statistics(h_inData, N, gridSize, blockSize);
+		cublasHandle_t handle;
+		cublasStatus_t stat;
+		double* d_in_min_max;   cudaMalloc((void**)&d_in_min_max, N * sizeof(double));
+		cudaMemcpy(d_in_min_max, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
+		int max_idx, min_idx;
+		cublasCreate(&handle);
+
+		stat = cublasIdamax(handle, N, d_in_min_max, 1, &max_idx);
+		if (stat != CUBLAS_STATUS_SUCCESS)
+			printf("Max failed\n");
+
+		stat = cublasIdamin(handle, N, d_in_min_max, 1, &min_idx);
+		if (stat != CUBLAS_STATUS_SUCCESS)
+			printf("Min failed\n");
+
+		maxV = h_inData[max_idx - 1];
+		minV = h_inData[min_idx - 1];
+		maxG = maxV;
+		minG = minV;
+		
+		cublasDestroy(handle);
+		cudaFree(d_in_min_max);
 
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("Statistics spent %lf seconds.\n", time_spent);
-
-		minG = minV;
-		maxG = maxV;
-		//std::cout << "Raw data analysis ends." << std::endl;
+		std::cout << "Raw data analysis ends." << std::endl;
 
 		/*********************************************************************************************************************
 													CHECK IF ANY ELEMENT IS NEGATIVE
