@@ -141,11 +141,14 @@ double timeElapsed(clock_t begin, clock_t end) {
 }
 
 
-struct RandomGenerator {
-	double lowerBound, upperBound;
+struct RandomGenerator_uniform_real_distribution {
+	double lowerBound, upperBound, seed;
 
 	__host__ __device__
-		RandomGenerator(double _lowerBound = 0.0f, double _upperBound = 1.0f) : lowerBound(_lowerBound), upperBound(_upperBound) {}
+		RandomGenerator_uniform_real_distribution(double _lowerBound = 0.0f, double _upperBound = 1.0f, int _seed = 1) : lowerBound(_lowerBound),
+																				upperBound(_upperBound), 
+																				seed(_seed)
+																				{}
 
 	__host__ __device__
 		double operator()(const unsigned int n) const
@@ -157,7 +160,7 @@ struct RandomGenerator {
 		thrust::uniform_real_distribution<double> dist(lowerBound, upperBound);
 
 		// jump past the numbers used by the subsequences before me
-		rng.discard(n);
+		rng.discard(n * seed);
 
 		// generate a random number from the range [lowerBound, upperBound)
 		return dist(rng);
@@ -225,7 +228,7 @@ int main() {
 		thrust::transform(index_sequence_begin,
 			index_sequence_begin + N,
 			d_in.begin(),
-			RandomGenerator(0.0f, 1.0f));
+			RandomGenerator_uniform_real_distribution(0.0f, 1.0f, i));
 
 		// test 
 		/*for (int i = 0; i < 100; i++)
