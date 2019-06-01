@@ -10,13 +10,14 @@
 
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <thrust/device_malloc.h>
 #include <thrust/iterator/counting_iterator.h>
-
 #include <thrust/random.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 #include <thrust/extrema.h>
 #include <thrust/execution_policy.h>
+
 
 // todo...
 // 1. when size of vector exceeds the maximum available device memory, some strategies should be taken here.
@@ -30,7 +31,7 @@
 									DECLARATION OF MACROS AND GLOBAL VARIABLES
 *********************************************************************************************************************/
 #define N 5120000
-#define ITERATION 1
+#define ITERATION 10
 
 double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
 int	   DECIMALPLACE = 1;
@@ -43,6 +44,7 @@ __device__ double pow(int DECIMALPLACE) {
 	}
 	return temp;
 }
+
 
 __global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *g_outData, int DECIMALPLACE) {
 	extern __shared__ double sharedMem[];
@@ -59,10 +61,10 @@ __global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *
 	__syncthreads();
 }
 
-__global__ void AddAbsMinKernel(double* g_inData, double min) {
+__global__ void AddAbsMinKernel(double* d_in, double min) {
 	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
 
-	g_inData[globalID] += abs(min);
+	d_in[globalID] += abs(min);
 }
 
 
@@ -282,7 +284,10 @@ int main() {
 		printf("Statistics spent %lf seconds.\n", time_spent);
 		std::cout << "Finding Max and Min ends." << std::endl;
 
-		
+		// Thrust data types are not understood by a CUDA kernel and need to be converted back to its 
+		// underlying pointer
+		double* d_in_raw = thrust::raw_pointer_cast(&d_in[0]);
+
 
 
 		/*********************************************************************************************************************
@@ -290,10 +295,10 @@ int main() {
 		*********************************************************************************************************************/
 		if (minG < 0) // if yes, launch a kernel to turn all values into positive
 		{
-			cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
-			AddAbsMinKernel << < gridSize, blockSize >> > (d_inData, minG);
-			cudaMemcpy(h_inData, d_inData, N * sizeof(double), cudaMemcpyDeviceToHost);
-			Statistics(h_inData, N, false);
+			//cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
+			AddAbsMinKernel << < gridSize, blockSize >> > (d_in_raw, minG);
+			//cudaMemcpy(h_inData, d_in, N * sizeof(double), cudaMemcpyDeviceToHost);
+			//Statistics(h_inData, N, false);
 		}
 
 
@@ -303,30 +308,30 @@ int main() {
 		DECIMALPLACE = FindMaxDecimalPlaces(blockSize, gridSize);
 		//DECIMALPLACE = 14;
 
-		cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
+		//cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
 
 		long long int sum = 0;
 
 
-		unsigned long long int *h_outData = (unsigned long long int*)malloc(gridSize * sizeof(unsigned long long int));
+		unsigned long long int *h_out = (unsigned long long int*)malloc(gridSize * sizeof(unsigned long long int));
 
-		unsigned long long int *d_outData; cudaMalloc(&d_outData, gridSize * sizeof(unsigned long long int));
+		unsigned long long int *d_out; cudaMalloc(&d_out, gridSize * sizeof(unsigned long long int));
 
 		printf("Kernel begins...\n");
 		begin = clock();
 
-		AtomicAddKernelULLInt << <gridSize, blockSize, blockSize * sizeof(double) >> > (d_inData, d_outData, DECIMALPLACE);
+		AtomicAddKernelULLInt << <gridSize, blockSize, blockSize * sizeof(double) >> > (d_in_raw, d_out, DECIMALPLACE);
 		cudaDeviceSynchronize();
 
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("Kernel spent %.15lf seconds.\n", time_spent);
 
-		cudaMemcpy(h_outData, d_outData, gridSize * sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+		cudaMemcpy(h_out, d_out, gridSize * sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
 
 		for (int j = 0; j < gridSize; j++)
 		{
-			sum += h_outData[j];
+			sum += h_out[j];
 		}
 
 		if (minG < 0)
@@ -343,10 +348,8 @@ int main() {
 
 		//printf("Accuracy: %.50lf", accResults[i]);
 
-		cudaFree(d_inData);
-		cudaFree(d_outData);
-		free(h_inData);
-		free(h_outData);
+		cudaFree(d_out);
+		free(h_out);
 		printf("----------------------------------------------------------\n");
 	}
 
