@@ -1,7 +1,6 @@
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include "cublas_v2.h"
 
 #include <stdio.h>
 #include <iostream>
@@ -9,34 +8,29 @@
 #include <stdlib.h>
 #include <time.h>
 
-#include <cstdio>
-#include <cstdlib>
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/iterator/counting_iterator.h>
+
+#include <thrust/random.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform.h>
+#include <thrust/extrema.h>
+#include <thrust/execution_policy.h>
+
+// todo...
+// 1. when size of vector exceeds the maximum available device memory, some strategies should be taken here.
+//		Divides original vector into smaller vectors?
 
 
 
-#if __DEVICE_EMULATION__
-#define DEBUG_SYNC __syncthreads();
-#else
-#define DEBUG_SYNC
-#endif
 
-#if (__CUDA_ARCH__ < 200)
-#define int_mult(x,y)	__mul24(x,y)	
-#else
-#define int_mult(x,y)	x*y
-#endif
 
 /*********************************************************************************************************************
 									DECLARATION OF MACROS AND GLOBAL VARIABLES
 *********************************************************************************************************************/
 #define N 5120000
-#define ITERATION 10
-
-const int blockSize1 = 4096 / 2;
-
-const int threads = 64;
-
-#define inf ULLONG_MAX 
+#define ITERATION 1
 
 double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
 int	   DECIMALPLACE = 1;
@@ -49,181 +43,6 @@ __device__ double pow(int DECIMALPLACE) {
 	}
 	return temp;
 }
-
-
-__device__ void warp_reduce_max(volatile double smem[64])
-{
-
-	smem[threadIdx.x] = smem[threadIdx.x + 32] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 32] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 16] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 16] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 8] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 8] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 4] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 4] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 2] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 2] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 1] > smem[threadIdx.x] ?
-		smem[threadIdx.x + 1] : smem[threadIdx.x];
-
-}
-
-__device__ void warp_reduce_min(volatile double smem[64])
-{
-
-	smem[threadIdx.x] = smem[threadIdx.x + 32] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 32] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 16] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 16] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 8] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 8] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 4] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 4] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 2] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 2] : smem[threadIdx.x];
-
-	smem[threadIdx.x] = smem[threadIdx.x + 1] < smem[threadIdx.x] ?
-		smem[threadIdx.x + 1] : smem[threadIdx.x];
-
-}
-
-template<int els_per_block, int threads>
-__global__ void find_min_max(double* in, double* out)
-{
-	__shared__ double smem_min[64];
-	__shared__ double smem_max[64];
-
-	int tid = threadIdx.x + blockIdx.x*els_per_block;
-
-	double max = -inf;
-	double min = inf;
-	double val;
-
-	const int iters = els_per_block / threads;
-
-#pragma unroll  
-	for (int i = 0; i < iters; i++)
-	{
-
-		val = in[tid + i * threads];
-
-		min = val < min ? val : min;
-		max = val > max ? val : max;
-
-	}
-
-
-	if (threads == 32)
-	{
-		smem_min[threadIdx.x + 32] = 0.0f;
-		smem_max[threadIdx.x + 32] = 0.0f;
-
-	}
-
-	smem_min[threadIdx.x] = min;
-	smem_max[threadIdx.x] = max;
-
-
-	__syncthreads();
-
-	if (threadIdx.x < 32)
-	{
-		warp_reduce_min(smem_min);
-		warp_reduce_max(smem_max);
-	}
-	if (threadIdx.x == 0)
-	{
-		out[blockIdx.x] = smem_min[threadIdx.x]; // out[0] == ans
-		out[blockIdx.x + gridDim.x] = smem_max[threadIdx.x];
-	}
-
-}
-
-template<int threads>
-__global__ void find_min_max_dynamic(double* in, double* out, int n, int start_adr, int num_blocks)
-{
-
-	__shared__ double smem_min[64];
-	__shared__ double smem_max[64];
-
-	int tid = threadIdx.x + start_adr;
-
-	double max = -inf;
-	double min = inf;
-	double val;
-
-
-	// tail part
-	int mult = 0;
-	for (int i = 1; mult + tid < n; i++)
-	{
-		val = in[tid + mult];
-
-		min = val < min ? val : min;
-		max = val > max ? val : max;
-
-		mult = int_mult(i, threads);
-	}
-
-	// previously reduced MIN part
-	mult = 0;
-	int i;
-	for (i = 1; mult + threadIdx.x < num_blocks; i++)
-	{
-		val = out[threadIdx.x + mult];
-
-		min = val < min ? val : min;
-
-		mult = int_mult(i, threads);
-	}
-
-	// MAX part
-	for (; mult + threadIdx.x < num_blocks * 2; i++)
-	{
-		val = out[threadIdx.x + mult];
-
-		max = val > max ? val : max;
-
-		mult = int_mult(i, threads);
-	}
-
-
-	if (threads == 32)
-	{
-		smem_min[threadIdx.x + 32] = 0.0f;
-		smem_max[threadIdx.x + 32] = 0.0f;
-
-	}
-
-	smem_min[threadIdx.x] = min;
-	smem_max[threadIdx.x] = max;
-
-	__syncthreads();
-
-	if (threadIdx.x < 32)
-	{
-		warp_reduce_min(smem_min);
-		warp_reduce_max(smem_max);
-	}
-	if (threadIdx.x == 0)
-	{
-		out[blockIdx.x] = smem_min[threadIdx.x]; // out[0] == ans
-		out[blockIdx.x + gridDim.x] = smem_max[threadIdx.x];
-	}
-
-
-}
-
 
 __global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *g_outData, int DECIMALPLACE) {
 	extern __shared__ double sharedMem[];
@@ -254,7 +73,7 @@ RAND_MAX = 32767
 double GetRand()
 {
 
-	return (double)rand() / (double)RAND_MAX *1000000;
+	return (double)rand() / (double)RAND_MAX;
 }
 
 
@@ -280,75 +99,23 @@ void Statistics(double* h_inData, int n, bool verbosity) {
 	if (verbosity)
 	{
 
-	average = sum1 / (double)n;
+		average = sum1 / (double)n;
 
-	/*  Compute  variance  and standard deviation  */
-	for (int i = 0; i < n; i++)
-	{
-		sum2 += powf((h_inData[i] - average), 2.0);
-	}
-	variance = sum2 / (double)n;
-	std_dev = sqrt(variance);
+		/*  Compute  variance  and standard deviation  */
+		for (int i = 0; i < n; i++)
+		{
+			sum2 += powf((h_inData[i] - average), 2.0);
+		}
+		variance = sum2 / (double)n;
+		std_dev = sqrt(variance);
 
-	
+
 		printf("Maximum number is %.25lf\n", maxV);
 		printf("Minimum number is %.25lf\n", minV);
 		printf("Average of all elements is %.25lf\n", average);
 		printf("variance of all elements is %.25lf\n", variance);
 		printf("Standard deviation is %.25lf\n", std_dev);
 	}
-}
-
-void findBlockSize(int* whichSize, int* num_el)
-{
-
-	const float pretty_big_number = 24.0f*1024.0f*1024.0f;
-
-	float ratio = float((*num_el)) / pretty_big_number;
-
-
-	if (ratio > 0.8f)
-		(*whichSize) = 5;
-	else if (ratio > 0.6f)
-		(*whichSize) = 4;
-	else if (ratio > 0.4f)
-		(*whichSize) = 3;
-	else if (ratio > 0.2f)
-		(*whichSize) = 2;
-	else
-		(*whichSize) = 1;
-
-
-}
-
-void compute_reduction(double* d_in, double* d_out, int num_els)
-{
-
-	int whichSize = -1;
-
-	findBlockSize(&whichSize, &num_els);
-
-	//whichSize = 5;
-
-	int block_size = powf(2, whichSize - 1)*blockSize1;
-	int num_blocks = num_els / block_size;
-	int tail = num_els - num_blocks * block_size;
-	int start_adr = num_els - tail;
-
-
-	if (whichSize == 1)
-		find_min_max<blockSize1, threads> << < num_blocks, threads >> > (d_in, d_out);
-	else if (whichSize == 2)
-		find_min_max<blockSize1 * 2, threads> << < num_blocks, threads >> > (d_in, d_out);
-	else if (whichSize == 3)
-		find_min_max<blockSize1 * 4, threads> << < num_blocks, threads >> > (d_in, d_out);
-	else if (whichSize == 4)
-		find_min_max<blockSize1 * 8, threads> << < num_blocks, threads >> > (d_in, d_out);
-	else
-		find_min_max<blockSize1 * 16, threads> << < num_blocks, threads >> > (d_in, d_out);
-
-	find_min_max_dynamic<threads> << < 1, threads >> > (d_in, d_out, num_els, start_adr, num_blocks);
-
 }
 
 
@@ -370,6 +137,48 @@ int FindMaxDecimalPlaces(int blockSize, int gridSize) {
 double timeElapsed(clock_t begin, clock_t end) {
 	return (double)(end - begin) / CLOCKS_PER_SEC;
 }
+
+
+struct RandomGenerator {
+	double lowerBound, upperBound;
+
+	__host__ __device__
+		RandomGenerator(double _lowerBound = 0.0f, double _upperBound = 1.0f) : lowerBound(_lowerBound), upperBound(_upperBound) {}
+
+	__host__ __device__
+		double operator()(const unsigned int n) const
+	{
+		// create a random number generator
+		thrust::default_random_engine rng;
+
+		// create a uniform_real_distribution to produce floats from [lowerBound, upperBound) given by function call
+		thrust::uniform_real_distribution<double> dist(lowerBound, upperBound);
+
+		// jump past the numbers used by the subsequences before me
+		rng.discard(n);
+
+		// generate a random number from the range [lowerBound, upperBound)
+		return dist(rng);
+	}
+};
+
+void maxDevice_vectorCheck() {
+	float free_m, total_m, used_m;
+
+	size_t free_t, total_t;
+
+	cudaMemGetInfo(&free_t, &total_t);
+
+	free_m = (unsigned int)free_t / 1048576.0;
+
+	total_m = (unsigned int)total_t / 1048576.0;
+
+	used_m = total_m - free_m;
+
+	printf("  mem free %d .... %f MB mem total %d....%f MB mem used %f MB\n", free_t, free_m, total_t, total_m, used_m);
+
+}
+
 
 
 
@@ -399,17 +208,29 @@ int main() {
 		/*********************************************************************************************************************
 													RAW DATA GENERATION
 		*********************************************************************************************************************/
-		double *h_inData = (double*)malloc(N * sizeof(double));
-		double *d_inData; cudaMalloc(&d_inData, N * sizeof(double));
+		//maxDevice_vectorCheck();
 
-		srand(i);
+		// create random input vector
+		thrust::device_vector<double> d_in(N);
+
+		// setup the counting_iterator as a seed of random generator
+		thrust::counting_iterator<unsigned long long int> index_sequence_begin(0);
 
 		printf("Data initilization begins...\n");
 		begin = clock();
-		for (int i = 0; i < N; i++)
+
+		// apply the transformation to each item of the counting_iterator to generate random number within specific range
+		thrust::transform(index_sequence_begin,
+			index_sequence_begin + N,
+			d_in.begin(),
+			RandomGenerator(0.0f, 1.0f));
+
+		// test 
+		/*for (int i = 0; i < 100; i++)
 		{
-			h_inData[i] = GetRand();
-		}
+			std::cout << d_in[i] << std::endl;
+		}*/
+
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("Data initilization spent %lf seconds.\n", time_spent);
@@ -418,48 +239,51 @@ int main() {
 		testSum = 0;
 		printf("CPU Summation begins...\n");
 		begin = clock();
-		/*for (int i = 0; i < N; i++)
+		
+		// copy d_in to host_vector h_in
+		thrust::host_vector<double> h_in = d_in;
+		
+		// get sum of input vector on CPU
+		for (int i = 0; i < N; i++)
 		{
-			testSum += h_inData[i];
-		}*/
+			testSum += h_in[i];
+		}
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("CPU Summation spent %lf seconds.\n", time_spent);
 
-		
+
 		/*******************************************************************************************************
 													FIND MIN AND MAX
 		********************************************************************************************************/
-		
+		printf("Finding Max and Min begins...\n");
 		begin = clock();
 
-		cublasHandle_t handle;
-		cublasStatus_t stat;
-		double* d_in_min_max;   cudaMalloc((void**)&d_in_min_max, N * sizeof(double));
-		cudaMemcpy(d_in_min_max, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
-		int max_idx, min_idx;
-		cublasCreate(&handle);
+		// get the tuple of (absolute position of minimum , absolute position of maximum), 
+		// each of which is accessible with .first and .second
+		thrust::pair<thrust::device_vector<double>::iterator, thrust::device_vector<double>::iterator> result 
+			= thrust::minmax_element(d_in.begin(), d_in.end());
+		
+		// get the offset in device_vector
+		unsigned long long int minPos = result.first - d_in.begin();
+		unsigned long long int maxPos = result.second - d_in.begin();
 
-		stat = cublasIdamax(handle, N, d_in_min_max, 1, &max_idx);
-		if (stat != CUBLAS_STATUS_SUCCESS)
-			printf("Max failed\n");
+		// test
+		/*std::cout << d_in[minPos] << std::endl;
+		std::cout << d_in[maxPos] << std::endl;*/
 
-		stat = cublasIdamin(handle, N, d_in_min_max, 1, &min_idx);
-		if (stat != CUBLAS_STATUS_SUCCESS)
-			printf("Min failed\n");
-
-		maxV = h_inData[max_idx - 1];
-		minV = h_inData[min_idx - 1];
+		maxV = d_in[maxPos];
+		minV = d_in[minPos];
 		maxG = maxV;
 		minG = minV;
-		
-		cublasDestroy(handle);
-		cudaFree(d_in_min_max);
 
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("Statistics spent %lf seconds.\n", time_spent);
-		std::cout << "Raw data analysis ends." << std::endl;
+		std::cout << "Finding Max and Min ends." << std::endl;
+
+		
+
 
 		/*********************************************************************************************************************
 													CHECK IF ANY ELEMENT IS NEGATIVE
@@ -482,7 +306,7 @@ int main() {
 		cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
 
 		long long int sum = 0;
-	
+
 
 		unsigned long long int *h_outData = (unsigned long long int*)malloc(gridSize * sizeof(unsigned long long int));
 
@@ -516,7 +340,7 @@ int main() {
 
 		accResults[i] = 1 - (abs(results[i] - testSum) / testSum);
 
-	
+
 		//printf("Accuracy: %.50lf", accResults[i]);
 
 		cudaFree(d_inData);
