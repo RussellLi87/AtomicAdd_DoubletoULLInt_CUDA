@@ -25,13 +25,11 @@
 
 
 
-
-
 /*********************************************************************************************************************
 									DECLARATION OF MACROS AND GLOBAL VARIABLES
 *********************************************************************************************************************/
-#define N 5120000
-#define ITERATION 10
+#define N 512000000
+#define ITERATION 100
 
 double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
 int	   DECIMALPLACE = 1;
@@ -52,30 +50,23 @@ __global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *
 	int threadID = threadIdx.x;
 	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
 
+	g_outData[blockIdx.x] = 0;
 	sharedMem[threadID] = g_inData[globalID];
 	__syncthreads();
-
 
 	unsigned long long int temp = round(sharedMem[threadID] * pow(DECIMALPLACE));
 	atomicAdd(&g_outData[blockIdx.x], temp);
 	__syncthreads();
+
+	
+	//printf("%llu\n", g_outData[blockIdx.x]);
+	
 }
 
 __global__ void AddAbsMinKernel(double* d_in, double min) {
 	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
 
 	d_in[globalID] += abs(min);
-}
-
-
-/***
-Random number generator in the range of [0,1)
-RAND_MAX = 32767
-*/
-double GetRand()
-{
-
-	return (double)rand() / (double)RAND_MAX;
 }
 
 
@@ -149,7 +140,6 @@ struct RandomGenerator_uniform_real_distribution {
 																				upperBound(_upperBound), 
 																				seed(_seed)
 																				{}
-
 	__host__ __device__
 		double operator()(const unsigned int n) const
 	{
@@ -164,6 +154,26 @@ struct RandomGenerator_uniform_real_distribution {
 
 		// generate a random number from the range [lowerBound, upperBound)
 		return dist(rng);
+	}
+};
+
+struct RandomGenerator_normal_distribution {
+	double mean, std;
+
+	__host__ __device__
+		RandomGenerator_normal_distribution(double _mean = 0.0f, double _std = 2.5f) : mean(_mean), std(_std) {}
+
+	__host__ __device__
+		double operator()(const double mean, const double std) const {
+		// create a minstd_rand object to act as our source of randomness
+		thrust::minstd_rand rng;
+
+		// create a normal_distribution to produce floats from the Normal distribution
+		// with mean and standard deviation
+		thrust::random::normal_distribution<double> dist(mean, std);
+
+		return dist(rng);
+
 	}
 };
 
@@ -218,7 +228,7 @@ int main() {
 		// create random input vector
 		thrust::device_vector<double> d_in(N);
 
-		// setup the counting_iterator as a seed of random generator
+		//// setup the counting_iterator as a seed of random generator
 		thrust::counting_iterator<unsigned long long int> index_sequence_begin(0);
 
 		printf("Data initilization begins...\n");
@@ -228,13 +238,37 @@ int main() {
 		thrust::transform(index_sequence_begin,
 			index_sequence_begin + N,
 			d_in.begin(),
-			RandomGenerator_uniform_real_distribution(0.0f, 1.0f, i));
+			RandomGenerator_uniform_real_distribution(0.0f, 1.0f, i+1));
 
-		// test 
-		/*for (int i = 0; i < 100; i++)
+
+		//// copy d_in to host_vector h_in
+		//thrust::host_vector<double> h_in(N);
+
+		//// create a minstd_rand object to act as our source of randomness
+		//thrust::minstd_rand rng;
+		//// create a normal_distribution to produce floats from the Normal distribution
+		//	// with mean 2.0 and standard deviation 3.5
+		//thrust::random::normal_distribution<double> dist(2.0f, 3.5f);
+
+		/*for (int i = 0; i < N; i++)
 		{
-			std::cout << d_in[i] << std::endl;
+			d_in[i] = dist(rng);
 		}*/
+
+		// copy h_in to host_vector d_in
+		//thrust::device_vector<double> d_in = h_in;
+
+
+		// copy d_in to host_vector h_in
+		thrust::host_vector<double> h_in = d_in;
+		
+
+		// test
+		/*double* h_in_raw = thrust::raw_pointer_cast(&h_in[0]);
+		Statistics(h_in_raw, N, 1);*/
+
+
+
 
 		end = clock();
 		time_spent = timeElapsed(begin, end);
@@ -245,14 +279,14 @@ int main() {
 		printf("CPU Summation begins...\n");
 		begin = clock();
 		
-		// copy d_in to host_vector h_in
-		thrust::host_vector<double> h_in = d_in;
-		
+
 		// get sum of input vector on CPU
 		for (int i = 0; i < N; i++)
 		{
 			testSum += h_in[i];
 		}
+		std::cout << "CPU result: " << testSum << std::endl;
+
 		end = clock();
 		time_spent = timeElapsed(begin, end);
 		printf("CPU Summation spent %lf seconds.\n", time_spent);
@@ -292,7 +326,6 @@ int main() {
 		double* d_in_raw = thrust::raw_pointer_cast(&d_in[0]);
 
 
-
 		/*********************************************************************************************************************
 													CHECK IF ANY ELEMENT IS NEGATIVE
 		*********************************************************************************************************************/
@@ -309,11 +342,9 @@ int main() {
 													FIND MAXIMUM DECIMAL PLACES
 		*********************************************************************************************************************/
 		DECIMALPLACE = FindMaxDecimalPlaces(blockSize, gridSize);
-		//DECIMALPLACE = 14;
+		//DECIMALPLACE = 11;
 
-		//cudaMemcpy(d_inData, h_inData, N * sizeof(double), cudaMemcpyHostToDevice);
-
-		long long int sum = 0;
+		unsigned long long int sum = 0;
 
 
 		unsigned long long int *h_out = (unsigned long long int*)malloc(gridSize * sizeof(unsigned long long int));
@@ -337,6 +368,7 @@ int main() {
 			sum += h_out[j];
 		}
 
+
 		if (minG < 0)
 		{
 			results[i] = ((double)sum / pow(10, DECIMALPLACE)) - ((abs(minG) * N));
@@ -346,8 +378,9 @@ int main() {
 			results[i] = (double)sum / pow(10, DECIMALPLACE);
 		}
 
-		accResults[i] = 1 - (abs(results[i] - testSum) / testSum);
+		//std::cout << "~~~~~~~~~~~~~~~~" << results[0] << std::endl;
 
+		accResults[i] = 1 - (abs(results[i] - testSum) / testSum);
 
 		//printf("Accuracy: %.50lf", accResults[i]);
 
