@@ -216,9 +216,11 @@ int main() {
 			// with mean 0.0 and standard deviation 3.5
 		thrust::random::normal_distribution<double> dist(0.0f, 3.5f);
 
-		for (int i = 0; i < N; i++)
+
+		for (int j = 0; j < N; j++)
 		{
-			h_in[i] = dist(rng);
+			rng.discard(j * i);
+			h_in[j] = dist(rng);
 		}
 
 
@@ -241,9 +243,9 @@ int main() {
 
 
 		// get sum of input vector on CPU
-		for (int i = 0; i < N; i++)
+		for (int j = 0; j < N; j++)
 		{
-			testSum += h_in[i];
+			testSum += h_in[j];
 		}
 		std::cout << "CPU result: " << testSum << std::endl;
 
