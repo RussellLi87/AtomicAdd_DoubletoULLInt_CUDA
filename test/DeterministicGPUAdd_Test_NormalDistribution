@@ -1,0 +1,353 @@
+
+#include "cuda_runtime.h"
+#include "device_launch_parameters.h"
+
+#include <stdio.h>
+#include <iostream>
+#include <math.h>
+#include <stdlib.h>
+#include <time.h>
+
+#include <thrust/host_vector.h>
+#include <thrust/device_vector.h>
+#include <thrust/device_malloc.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/random.h>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform.h>
+#include <thrust/extrema.h>
+#include <thrust/execution_policy.h>
+
+
+// todo...
+// 1. when size of vector exceeds the maximum available device memory, some strategies should be taken here.
+//		Divides original vector into smaller vectors?
+
+
+
+/*********************************************************************************************************************
+									DECLARATION OF MACROS AND GLOBAL VARIABLES
+*********************************************************************************************************************/
+#define N 5120000
+#define ITERATION 10
+
+double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
+int	   DECIMALPLACE = 1;
+
+__device__ double pow(int DECIMALPLACE) {
+	double temp = 10.0;
+	for (int i = DECIMALPLACE - 1; i > 0; i--)
+	{
+		temp *= 10;
+	}
+	return temp;
+}
+
+
+__global__ void AtomicAddKernelULLInt(double *g_inData, unsigned long long int *g_outData, int DECIMALPLACE) {
+	extern __shared__ double sharedMem[];
+
+	int threadID = threadIdx.x;
+	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
+
+	g_outData[blockIdx.x] = 0;
+	sharedMem[threadID] = g_inData[globalID];
+	__syncthreads();
+
+	unsigned long long int temp = round(sharedMem[threadID] * pow(DECIMALPLACE));
+	atomicAdd(&g_outData[blockIdx.x], temp);
+	__syncthreads();
+
+
+	//printf("%llu\n", g_outData[blockIdx.x]);
+
+}
+
+__global__ void AddAbsMinKernel(double* d_in, double min) {
+	int globalID = blockDim.x * blockIdx.x + threadIdx.x;
+
+	d_in[globalID] += abs(min);
+}
+
+
+/****
+	Find maximum, minimum, mean, variance and standard deviation of a vector
+**/
+void Statistics(double* h_inData, int n, bool verbosity) {
+	average = 0, variance = 0, std_dev = 0, sum1 = 0, sum2 = 0, minV = 0, maxV = 0;
+	minV = h_inData[0];
+
+	/*  Compute the sum of all elements
+		and the max and min	*/
+	for (int i = 0; i < n; i++)
+	{
+		if (verbosity)
+		{
+			sum1 += h_inData[i];
+		}
+		maxV = fmax(maxV, h_inData[i]);
+		minV = fmin(minV, h_inData[i]);
+	}
+
+	if (verbosity)
+	{
+
+		average = sum1 / (double)n;
+
+		/*  Compute  variance  and standard deviation  */
+		for (int i = 0; i < n; i++)
+		{
+			sum2 += powf((h_inData[i] - average), 2.0);
+		}
+		variance = sum2 / (double)n;
+		std_dev = sqrt(variance);
+
+
+		printf("Maximum number is %.25lf\n", maxV);
+		printf("Minimum number is %.25lf\n", minV);
+		printf("Average of all elements is %.25lf\n", average);
+		printf("variance of all elements is %.25lf\n", variance);
+		printf("Standard deviation is %.25lf\n", std_dev);
+	}
+}
+
+
+int FindMaxDecimalPlaces(int blockSize, int gridSize) {
+	double temp;
+	int places = -1;
+
+	temp = LLONG_MAX / (maxG * blockSize * gridSize);
+	while (temp > 1)
+	{
+		temp /= 10;
+		places++;
+	}
+	std::cout << "Largest decimal places is " << places << std::endl;
+	return places;
+
+}
+
+double timeElapsed(clock_t begin, clock_t end) {
+	return (double)(end - begin) / CLOCKS_PER_SEC;
+}
+
+
+struct RandomGenerator_uniform_real_distribution {
+	double lowerBound, upperBound, seed;
+
+	__host__ __device__
+		RandomGenerator_uniform_real_distribution(double _lowerBound = 0.0f, double _upperBound = 1.0f, int _seed = 1) : lowerBound(_lowerBound),
+		upperBound(_upperBound),
+		seed(_seed)
+	{}
+	__host__ __device__
+		double operator()(const unsigned int n) const
+	{
+		// create a random number generator
+		thrust::default_random_engine rng;
+
+		// create a uniform_real_distribution to produce floats from [lowerBound, upperBound) given by function call
+		thrust::uniform_real_distribution<double> dist(lowerBound, upperBound);
+
+		// jump past the numbers used by the subsequences before me
+		rng.discard(n * seed);
+
+		// generate a random number from the range [lowerBound, upperBound)
+		return dist(rng);
+	}
+};
+
+
+void maxDevice_vectorCheck() {
+	float free_m, total_m, used_m;
+
+	size_t free_t, total_t;
+
+	cudaMemGetInfo(&free_t, &total_t);
+
+	free_m = (unsigned int)free_t / 1048576.0;
+
+	total_m = (unsigned int)total_t / 1048576.0;
+
+	used_m = total_m - free_m;
+
+	printf("  mem free %d .... %f MB mem total %d....%f MB mem used %f MB\n", free_t, free_m, total_t, total_m, used_m);
+
+}
+
+
+
+
+/*********************************************************************************************************************
+														MAIN
+*********************************************************************************************************************/
+int main() {
+	/*********************************************************************************************************************
+											CONFIGURE CUDA GRID
+	*********************************************************************************************************************/
+	int blockSize;
+	int gridSize;
+	blockSize = 512;
+	gridSize = (N + blockSize - 1) / blockSize;
+
+	double* results = (double*)malloc(sizeof(double) * ITERATION);
+	double* accResults = (double*)malloc(sizeof(double) * ITERATION);
+	double testSum;
+	clock_t begin, end;
+	double time_spent;
+
+
+	for (int i = 0; i < ITERATION; i++)
+	{
+		printf("%dth...\n", i);
+
+		/*********************************************************************************************************************
+													RAW DATA GENERATION
+		*********************************************************************************************************************/
+
+		printf("Data initilization begins...\n");
+		begin = clock();
+
+		thrust::host_vector<double> h_in(N);
+
+		//// create a minstd_rand object to act as our source of randomness
+		thrust::minstd_rand rng;
+		// create a normal_distribution to produce floats from the Normal distribution
+			// with mean 0.0 and standard deviation 3.5
+		thrust::random::normal_distribution<double> dist(0.0f, 3.5f);
+
+		for (int i = 0; i < N; i++)
+		{
+			h_in[i] = dist(rng);
+		}
+
+
+		// test
+		/*double* h_in_raw = thrust::raw_pointer_cast(&h_in[0]);
+		Statistics(h_in_raw, N, 1);*/
+
+
+		thrust::device_vector<double> d_in = h_in;
+
+
+		end = clock();
+		time_spent = timeElapsed(begin, end);
+		printf("Data initilization spent %lf seconds.\n", time_spent);
+
+
+		testSum = 0;
+		printf("CPU Summation begins...\n");
+		begin = clock();
+
+
+		// get sum of input vector on CPU
+		for (int i = 0; i < N; i++)
+		{
+			testSum += h_in[i];
+		}
+		std::cout << "CPU result: " << testSum << std::endl;
+
+		end = clock();
+		time_spent = timeElapsed(begin, end);
+		printf("CPU Summation spent %lf seconds.\n", time_spent);
+
+
+		/*******************************************************************************************************
+													FIND MIN AND MAX
+		********************************************************************************************************/
+		printf("Finding Max and Min begins...\n");
+		begin = clock();
+
+		// get the tuple of (absolute position of minimum , absolute position of maximum), 
+		// each of which is accessible with .first and .second
+		thrust::pair<thrust::device_vector<double>::iterator, thrust::device_vector<double>::iterator> result
+			= thrust::minmax_element(d_in.begin(), d_in.end());
+
+		// get the offset in device_vector
+		unsigned long long int minPos = result.first - d_in.begin();
+		unsigned long long int maxPos = result.second - d_in.begin();
+
+		// test
+		/*std::cout << d_in[minPos] << std::endl;
+		std::cout << d_in[maxPos] << std::endl;*/
+
+		maxV = d_in[maxPos];
+		minV = d_in[minPos];
+		maxG = maxV;
+		minG = minV;
+
+		end = clock();
+		time_spent = timeElapsed(begin, end);
+		printf("Statistics spent %lf seconds.\n", time_spent);
+		std::cout << "Finding Max and Min ends." << std::endl;
+
+		// Thrust data types are not understood by a CUDA kernel and need to be converted back to its 
+		// underlying pointer
+		double* d_in_raw = thrust::raw_pointer_cast(&d_in[0]);
+
+
+		/*********************************************************************************************************************
+													CHECK IF ANY ELEMENT IS NEGATIVE
+		*********************************************************************************************************************/
+		if (minG < 0) // if yes, launch a kernel to turn all values into positive
+		{		
+			AddAbsMinKernel << < gridSize, blockSize >> > (d_in_raw, minG);
+			
+		}
+
+
+		/*********************************************************************************************************************
+													FIND MAXIMUM DECIMAL PLACES
+		*********************************************************************************************************************/
+		DECIMALPLACE = FindMaxDecimalPlaces(blockSize, gridSize);
+		//DECIMALPLACE = 11;
+
+		unsigned long long int sum = 0;
+
+
+		unsigned long long int *h_out = (unsigned long long int*)malloc(gridSize * sizeof(unsigned long long int));
+
+		unsigned long long int *d_out; cudaMalloc(&d_out, gridSize * sizeof(unsigned long long int));
+
+		printf("Kernel begins...\n");
+		begin = clock();
+
+		AtomicAddKernelULLInt << <gridSize, blockSize, blockSize * sizeof(double) >> > (d_in_raw, d_out, DECIMALPLACE);
+		cudaDeviceSynchronize();
+
+		end = clock();
+		time_spent = timeElapsed(begin, end);
+		printf("Kernel spent %.15lf seconds.\n", time_spent);
+
+		cudaMemcpy(h_out, d_out, gridSize * sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+
+		for (int j = 0; j < gridSize; j++)
+		{
+			sum += h_out[j];
+		}
+
+		double temp;
+		if (minG < 0)
+		{
+			results[i] = ((double)sum / pow(10, DECIMALPLACE)) - ((abs(minG) * N));
+		}
+		else
+		{
+			results[i] = (double)sum / pow(10, DECIMALPLACE);
+		}
+
+		//std::cout << "~~~~~~~~~~~~~~~~" << results[i] << std::endl;
+
+		accResults[i] = 1 - (abs(results[i] - testSum) / abs(testSum));
+
+
+		//printf("Accuracy: %.50lf", accResults[i]);
+
+		cudaFree(d_out);
+		free(h_out);
+		printf("----------------------------------------------------------\n");
+	}
+
+	Statistics(accResults, ITERATION, true);
+
+}
