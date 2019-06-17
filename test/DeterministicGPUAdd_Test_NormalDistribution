@@ -29,7 +29,7 @@
 									DECLARATION OF MACROS AND GLOBAL VARIABLES
 *********************************************************************************************************************/
 #define N 5120000
-#define ITERATION 10
+#define ITERATION 1
 
 double average, variance, std_dev, sum1, sum2, minV, maxV, minG, maxG;
 int	   DECIMALPLACE = 1;
@@ -214,7 +214,7 @@ int main() {
 		thrust::minstd_rand rng;
 		// create a normal_distribution to produce floats from the Normal distribution
 			// with mean 0.0 and standard deviation 3.5
-		thrust::random::normal_distribution<double> dist(0.0f, 3.5f);
+		thrust::random::normal_distribution<double> dist(0.0f, 100000000000.0f);
 
 
 		for (int j = 0; j < N; j++)
@@ -302,6 +302,11 @@ int main() {
 													FIND MAXIMUM DECIMAL PLACES
 		*********************************************************************************************************************/
 		DECIMALPLACE = FindMaxDecimalPlaces(blockSize, gridSize);
+		if (DECIMALPLACE == 0)
+		{
+			std::cout << "Overflow." << std::endl;
+			return 10;
+		}
 		//DECIMALPLACE = 11;
 
 		unsigned long long int sum = 0;
